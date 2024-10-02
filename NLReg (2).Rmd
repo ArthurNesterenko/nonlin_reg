@@ -1,0 +1,410 @@
+---
+title: "Нелинейная регрессия"
+output: html_notebook
+---
+
+
+<style type="text/css">
+.main-container {
+  max-width: 100% !important;
+  margin: auto;
+}
+</style>
+
+
+```{r, include=FALSE}
+library(car)
+library(nlme)
+library(ggplot2)
+library(GGally)
+library(psych)
+library(dplyr)
+library(olsrr)
+library(ggtrendline)
+#library(aomisc)
+library(ggpubr)
+```
+```{r}
+chooseCRANmirror()
+```
+
+## Данные
+
+```{r}
+data <- read.csv("Cellphone.csv") |> mutate(resolution = resoloution) |> select(-resoloution)
+head(data)
+```
+
+## Статистическая сводка
+
+```{r, rows.print=14}
+options(width = 100)
+
+describe(data, type = 1)[c(2, 3, 13, 4, 5, 8, 9, 11, 12)]
+```
+
+```{r, fig.asp=1, fig.width=25}
+ggpairs(data,
+        diag = list(
+          discrete = wrap('barDiag', bins = 10),
+          continuous = wrap('barDiag', bins = 10)
+        ),
+        progress = FALSE) +
+  theme(strip.text = element_text(size = 16, face = "bold"))
+```
+
+**Product_id** -- уникальный идентификатор телефона\
+**Price** -- цена телефона (таргет, непр.)\
+**Sale** -- количество продаж (непр.)\
+**weight** -- вес телефона (непр.)\
+**resolution** -- длина диагонали телефона (непр.)\
+**ppi** -- количество пикселей на 1 квадратный дюйм (непр.)\
+**cpu.core** -- количество ядер ЦПУ (дискр.)\
+**cpu.freq** -- частота ядер ЦПУ (непр.)\
+**internal.mem** -- память устройства (дискр.)\
+**ram** -- оперативная память устройства (дискр.)\
+**RearCam** -- разрешение задней камеры (дискр.)\
+**Front_Cam** -- разрешение передней камеры (дискр.)\
+**battery** -- объём аккумулятора (непр.)\
+**thickness** -- толщина корпуса (непр.)
+
+```{r}
+continuous_var <- c("Price", "Sale", "weight", "resolution", 
+                    "ppi", "cpu.freq", "battery", "thickness")
+cont_log_var <- c(sapply(continuous_var[continuous_var != "cpu.freq"], paste0, "_log"), "cpu.freq")
+names(cont_log_var) <- NULL
+discrete_var <- setdiff(names(data), c(continuous_var, "Product_id"))
+```
+
+## Логарифмизация
+```{r}
+data.log <- data |> mutate(
+  Price_log = log(Price),
+  Sale_log = log(Sale),
+  weight_log = log(weight),
+  resolution_log = log(resolution),
+  ppi_log = log(ppi),
+  battery_log = log(battery),
+  thickness_log = log(thickness)
+) |> select(all_of(c("Product_id", cont_log_var, discrete_var)))
+```
+
+```{r, echo=FALSE}
+describe(data.log[cont_log_var], type = 1)[c(2, 3, 13, 4, 5, 8, 9, 11, 12)]
+```
+
+```{r, fig.asp=1, fig.width=25, echo=FALSE}
+ggpairs(data.log |> select(-Product_id),
+        diag = list(
+          discrete = wrap('barDiag', bins = 10),
+          continuous = wrap('barDiag', bins = 10)
+        ),
+        progress = FALSE) +
+  theme(strip.text = element_text(size = 16, face = "bold"))
+```
+### Выбросы
+```{r, fig.asp=1, fig.width=25, warning=FALSE}
+data.log |> mutate(outlier = factor((Price_log < 7) + 0.5 * (weight_log > 5.5))) |> select(-Product_id) |>
+  ggpairs(
+    aes(color = outlier),
+    diag = list(
+      discrete = wrap('barDiag', bins = 10),
+      continuous = wrap('barDiag', bins = 10)
+    ),
+    progress = FALSE,
+    columns = union(cont_log_var, discrete_var)
+  ) +
+  theme(strip.text = element_text(size = 16, face = "bold"))
+```
+```{r}
+data.clean <- data.log |> filter(Price_log >= 7 & weight_log <= 5.5)
+```
+
+```{r, rows.print=14, echo=FALSE}
+describe(data.clean[cont_log_var], type = 1)[c(2, 3, 13, 4, 5, 8, 9, 11, 12)]
+```
+
+```{r, fig.asp=1, fig.width=25, echo=FALSE}
+ggpairs(data.clean |> select(-Product_id),
+        diag = list(
+          discrete = wrap('barDiag', bins = 10),
+          continuous = wrap('barDiag', bins = 10)
+        ),
+        progress = FALSE) +
+  theme(strip.text = element_text(size = 16, face = "bold"))
+```
+## Baseline линейная регрессия
+```{r}
+lin_model <- lm(Price_log ~ . - Product_id, data = data.clean)
+summary(lin_model)
+```
+```{r, rows.print=12}
+cbind(ols_vif_tol(lin_model), ols_correlations(lin_model)) |>
+  as.data.frame() |>
+  select(Tolerance, Partial, VIF) |>
+  mutate(Partial = round(Partial, 6))
+```
+```{r, fig.align='center'}
+data.clean |> mutate(core.freq = cpu.core * cpu.freq) |> ggplot(aes(x = core.freq, y = Price_log)) + geom_point()
+```
+
+```{r}
+lin_model.base <- lm(
+  Price_log ~ ppi_log + battery_log + thickness_log + I(cpu.core * cpu.freq) + internal.mem + ram,
+  data = data.clean
+)
+summary(lin_model.base)
+```
+Для cpu.core + cpu.freq: $R^2 = 0.9306$, $R^2_{adj} = 0.9268$
+
+**RMSE**: 
+```{r}
+lin_model.base$residuals^2 |> sum() |> sqrt()
+```
+
+
+## Нелинейная регрессия
+```{r, include=FALSE}
+ggpairs_ith_row <- function(pairs_plot, row = 1, primary_var) {
+  plots <- lapply(1:pairs_plot$ncol, function(j)
+    getPlot(pairs_plot, i = row, j = j))
+  ggmatrix(
+    plots,
+    nrow = 1,
+    ncol = pairs_plot$ncol,
+    xAxisLabels = pairs_plot$xAxisLabels,
+    yAxisLabels = primary_var
+  )
+}
+```
+
+```{r, fig.asp=0.125, fig.width=25, echo=FALSE}
+plot.mat <- data.clean |> select(Price_log,
+                     ppi_log,
+                     battery_log,
+                     thickness_log,
+                     cpu.core,
+                     cpu.freq,
+                     internal.mem,
+                     ram) |>
+  ggpairs(
+    diag = list(
+      discrete = wrap('barDiag', bins = 10),
+      continuous = wrap('barDiag', bins = 10)
+    ),
+    upper = list(
+      continuous = "points",
+      combo = "box_no_facet",
+      discrete = "facetbar",
+      na = "na"
+    ),
+    lower = list(
+      continuous = "cor",
+      combo = "facethist",
+      discrete = "count",
+      na = "na"
+    ),
+    progress = FALSE
+  ) +
+  theme(strip.text = element_text(size = 16, face = "bold"))
+
+ggpairs_ith_row(plot.mat, primary_var = "Price_log") |> print()
+```
+
+
+### Модели:
+$$\Huge y = f(\mathbf{x}, \boldsymbol{\theta}) + \varepsilon$$
+  
+1. $$\Large f = \theta_0 + \theta_1 \text{ppi_log} + \theta_2 \text{battery_log} +
+  \theta_3 \text{thickness_log} + \theta_4 \text{cpu.core}\cdot \text{cpu.freq} - 
+  \theta_5 \exp\{-\theta_6 \text{internal.mem}\} - \theta_7\exp\{-\theta_8 \text{ram}\}$$
+
+```{r}
+model_asymp <- function(..., params) {
+  with(list(...), 
+       ppi_log * params[1] + battery_log * params[2] + thickness_log * params[3] +
+         cpu.core * cpu.freq * params[4] - params[5] * exp(-params[6] * internal.mem) -
+         params[7] * exp(-params[8] * ram) + params[9]
+       )
+}
+model_logistic <- function(..., params) {
+  with(list(...), 
+       ppi_log * params[1] + battery_log * params[2] + thickness_log * params[3] +
+         cpu.core * cpu.freq * params[4] + params[5] + (params[6] - params[5])/(1 + exp(-params[7]*(internal.mem - params[8]))) +params[9]
+         (params[10] - params[9])/(1 + exp(-params[11]*(ram - params[12])))
+       )  
+  
+}
+model_power <- function(..., params) {
+  with(list(...), 
+       ppi_log * params[1] + battery_log * params[2] + thickness_log * params[3] +
+         cpu.core * cpu.freq * params[4] +  params[5] * internal.mem^(params[6]) +
+ + params[7] * ram^(params[8] + params[9])
+       )
+}
+
+model_weibull <- function(..., params) {
+  with(list(...), 
+       ppi_log * params[1] + battery_log * params[2] + thickness_log * params[3] +
+         cpu.core * cpu.freq * params[4] + params[5] + (params[6] - params[5])*(1 - exp(-exp(params[7]*(log(internal.mem) - log(params[8]))))) + params[9] + (params[10] - params[9])*(1 - exp(-exp(params[11]*(log(ram) - log(params[12])))))
+       )
+}
+```
+
+
+```{r}
+data.clean.nonzero <- data.clean[data.clean != 0,][1:135,]
+```
+
+## Асимптотическая модель
+### Подбор параметров
+```{r}
+
+asymp.nlm <- nls(Price_log ~ model_asymp(ppi_log = ppi_log, battery_log = battery_log,
+                                         thickness_log = thickness_log, 
+                              start.point.asymp = list(t0 = lin_model.base$coefficients[1],
+                         t1 = lin_model.base$coefficients[2],
+                         t2 = lin_model.base$coefficients[3],
+                         t3 = lin_model.base$coefficients[4],
+                         t4 = lin_model.base$coefficients[5],
+                         t5 = lm(log(Price_log) ~ internal.mem, data = data.clean)$coefficients[1],
+                         t6 = lm(log(Price_log) ~ internal.mem, data = data.clean)$coefficients[2],
+                         t7 = lm(log(Price_log) ~ ram, data = data.clean)$coefficients[1],
+                         t8 = lm(log(Price_log) ~ ram, data = data.clean)$coefficients[2]
+                         )           cpu.core = cpu.core, cpu.freq = cpu.freq,
+                                         internal.mem = internal.mem, ram = ram,
+                                         params = c(t1, t2, t3, t4, t5, t6, t7, t8, t0)),
+                 data = data.clean, start = start.point.asymp)
+
+summary(asymp.nlm)
+```
+**RMSE**: 
+```{r}
+residuals(asymp.nlm)^2 |> sum() |> sqrt()
+```
+
+**Доверительные интервалы для новых параметров (bootstrap)**:
+```{r, message=FALSE, warning=FALSE}
+set.seed(10)
+boot.asymp <- Boot(asymp.nlm, ncores = 8)
+```
+
+```{r, fig.width=25, fig.dpi=80, message=FALSE, warning=FALSE}
+hist(boot.asymp, cex = 2.5)
+```
+
+
+**стартовые точки степенная**
+```{r}
+data.clean.new <- data.clean |> filter(internal.mem > 0 & ram > 0)
+
+logis.model.im <- nls(Price_log ~ SSpower2P(internal.mem, a, b), data = data.clean.new)
+logis.model.ram <- nls(Price_log ~ SSpower2P(ram, a, b), data = data.clean.new)
+
+start.point.power <- list(
+  t1 = lin_model.base$coefficients[2],
+  t2 = lin_model.base$coefficients[3],
+  t3 = lin_model.base$coefficients[4],
+  t4 = lin_model.base$coefficients[5],
+  t5 = lin_model.base$coefficients[6],
+  t6 = 1,
+  t7 = lin_model.base$coefficients[7],
+  t8 = 1,
+  t9 = lin_model.base$coefficients[9]
+  
+)
+power.nlm <- nls(Price_log ~ model_power(ppi_log = ppi_log, battery_log = battery_log,
+                                         thickness_log = thickness_log, 
+                                         cpu.core = cpu.core, cpu.freq = cpu.freq,
+                                         internal.mem = internal.mem, ram = ram,
+                                         params = c(t1, t2, t3, t4, t5, t6, t7, t8,t9)),
+                 data = data.clean.new, start = start.point.power,control = nls.control(warnOnly = TRUE, minFactor = 1e-5))
+```
+```{r}
+power.nlm <- nls(Price_log ~ model_power(ppi_log = ppi_log, battery_log = battery_log,
+                                         thickness_log = thickness_log, 
+                                         cpu.core = cpu.core, cpu.freq = cpu.freq,
+                                         internal.mem = internal.mem, ram = ram,
+                                         params = c(t1, t2, t3, t4, t5, t6, t7, t8,t9)),
+                 data = data.clean.new, start = start.point.power,control = nls.control(warnOnly = TRUE, minFactor = 1e-5))
+```
+
+
+```{r}
+summary(power.nlm)
+```
+```{r}
+residuals(power.nlm)^2 |> sum() |> sqrt()
+```
+```{r, message=FALSE, warning=FALSE}
+set.seed(10)
+boot.power <- Boot(power.nlm, ncores = 1)
+```
+
+```{r, fig.width=25, fig.dpi=80, message=FALSE, warning=FALSE}
+hist(boot.power, cex = 2.5)
+```
+**Weibul regression**
+```{r}
+
+
+logis.model.im.weibul <- nls(Price_log ~ SSweibull(internal.mem, a, b, c, d), data = data.clean.new)
+logis.model.ram.weibul <- nls(Price_log ~ SSweibull(ram, a, b, c, d), data = data.clean.new)
+
+start.point.weibull <- list(
+  t1 = lin_model.base$coefficients[2],
+  t2 = lin_model.base$coefficients[3],
+  t3 = lin_model.base$coefficients[4],
+  t4 = lin_model.base$coefficients[5],
+  
+  t5 = coefficients(logis.model.im.weibul)['a'],
+  t6 = coefficients(logis.model.im.weibul)['b'],
+  t7 = coefficients(logis.model.im.weibul)['c'],
+  t8 = coefficients(logis.model.im.weibul)['d'],
+  
+  t9 = coefficients(logis.model.ram.weibul)['a'],
+  t10 = coefficients(logis.model.ram.weibul)['b'],
+  t11 = coefficients(logis.model.ram.weibul)['c'],
+  t12 = coefficients(logis.model.ram.weibul)['d']
+)
+```
+**fit weibull**
+```{r}
+weibul.nlm <- nls(Price_log ~ model_weibull(ppi_log = ppi_log, battery_log = battery_log,
+                                         thickness_log = thickness_log, 
+                                         cpu.core = cpu.core, cpu.freq = cpu.freq,
+                                         internal.mem = internal.mem, ram = ram,
+                                         params = c(t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12)),
+                 data = data.clean.new, start = start.point.weibull,control = nls.control(warnOnly = TRUE, minFactor = 1e-5))
+```
+```{r}
+residuals(weibul.nlm)^2 |> sum() |> sqrt()
+```
+```{r}
+```
+
+
+```{r}
+summary(weibul.nlm)
+```
+```{r}
+preds <- data.frame(true.pred = data.clean.new$Price_log, pred.weibull = predict(weibul.nlm), pred.power = predict(power.nlm), index = c(1:131))
+weib.plot <- ggplot(data = preds,
+       aes(x = index, y = pred.weibull)) +
+  geom_point() +  geom_point(aes(y = true.pred ), col = 'red')
+power.plot <- ggplot(data = preds,
+       aes(x = index, y = pred.power), ) +
+  geom_point(col = 'blue') +   geom_point(aes(y = true.pred ), col = 'red')+geom_line(col = 'blue') +   geom_line(aes(y = true.pred ), col = 'red')
+ggarrange(power.plot, weib.plot,ggplot(data = preds,
+       aes(x = index, y = pred.power), ) +
+  geom_point(col = 'blue') +   geom_point(aes(y = true.pred ), col = 'red'))
+```
+
+
+```{r}
+#lines(album1$adverts, predict(album.sales), col = 'red')
+```
+
+
+
+
